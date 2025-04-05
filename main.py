@@ -6,22 +6,31 @@ from sklearn.preprocessing import normalize
 from skimage.io import imread
 from skimage import transform
 from tqdm import tqdm
-import glob2
-import json
 import time
-import logging
-from PIL import Image
-
-# Thiết lập logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Giả sử bạn đã có module face_detector.py cung cấp class YoloV5FaceDetector
+import glob2
 from face_detector import YoloV5FaceDetector
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query 
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import base64
+from PIL import Image
+import io
+import logging
+import ssl
+import unicodedata
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse
+from pydub import AudioSegment
+from voice2text import WhisperTranscriber
+from typing import Optional
+import time 
+os.environ['HF_HOME']= '/app/GhostFaceNets/cache'
 
-# ==========================
-# Định nghĩa class Detect
-# ==========================
+# Cấu hình logging
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+logger = logging.getLogger(__name__)
 class Detect:
     def __init__(self, model_file, known_user_path=None):
         """
@@ -59,13 +68,17 @@ class Detect:
         try:
             # Chuyển sang không gian màu RGB
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
             # Chuẩn hóa độ sáng và tương phản
             img = cv2.normalize(img, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+            
             # Làm mờ để giảm nhiễu
             img = cv2.GaussianBlur(img, (3, 3), 0)
+            
             # Resize và chuẩn hóa
             img = cv2.resize(img, target_size)
             img = img.astype(np.float32) / 127.5 - 1.0
+            
             return img
         except Exception as e:
             logger.error(f"Image preprocessing error: {e}")
@@ -98,7 +111,7 @@ class Detect:
         
         :param image: Ảnh đầu vào
         :param image_format: Định dạng màu của ảnh
-        :return: Bounding boxes, confidence scores, ảnh khuôn mặt đã căn chỉnh
+        :return: Bounding boxes, confidence scores, ảnh khuôn mặt
         """
         if image.shape[-1] == 4:
             image = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
@@ -140,12 +153,10 @@ class Detect:
                 nimgs.append(preprocessed_img)
                 image_classes.append(os.path.basename(os.path.dirname(image_name)))
 
-        # Nếu không tìm thấy ảnh nào hợp lệ
-        if len(nimgs) == 0:
-            raise ValueError("Không có ảnh nào được phát hiện khuôn mặt trong folder known_user")
-
+        # Chuẩn hóa ảnh
+        nimgs = (np.array(nimgs) - 127.5) * 0.0078125
+        
         # Tạo embedding theo batch
-        nimgs = np.array(nimgs)
         embeddings = [
             self.face_model(nimgs[ii * batch_size : (ii + 1) * batch_size]) 
             for ii in tqdm(range(len(image_classes) // batch_size), "Embedding")
@@ -167,7 +178,7 @@ class Detect:
         
         :param image: Ảnh đầu vào
         :param dist_thresh: Ngưỡng khoảng cách để phân loại
-        :return: Khoảng cách, nhãn, bounding boxes, confidence scores
+        :return: Khoảng cách, nhãn, bounding boxes
         """
         if self.embeddings is None or self.image_classes is None:
             raise ValueError("No known user embeddings loaded")
@@ -180,14 +191,14 @@ class Detect:
         # Tiền xử lý ảnh trước khi tạo embedding
         processed_nimgs = np.array([self.preprocess_image(img) for img in nimgs])
         
-        # Tạo embedding cho khuôn mặt chưa biết
+        # Tạo embedding
         emb_unk = self.face_model(processed_nimgs).numpy()
         emb_unk = normalize(emb_unk)
         
         # So sánh embedding
         dists = np.dot(self.embeddings, emb_unk.T).T
         rec_idx = dists.argmax(-1)
-        rec_dist = [dists[i, rec_idx[i]] for i in range(len(rec_idx))]
+        rec_dist = [dists[id, ii] for id, ii in enumerate(rec_idx)]
         
         # Gán nhãn "Unknown" nếu khoảng cách thấp hơn ngưỡng
         rec_class = []
@@ -211,89 +222,117 @@ class Detect:
             color = (0, 0, 255) if dist < dist_thresh else (0, 255, 0)
             label = "Unknown" if dist < dist_thresh else label
             left, up, right, down = bb
+            
             cv2.rectangle(frame, (left, up), (right, down), color, 2)
             cv2.putText(frame, f"Label: {label}, dist: {dist:.4f}", 
                         (left, up - 10), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        
         return frame
 
-# ==========================
-# Hàm nhận diện folder ảnh
-# ==========================
-def recognize_folder_images(detector, folder_path, output_json_path="results_folder.json", dist_thresh=0.45):
-    """
-    Duyệt qua tất cả ảnh trong folder và thực hiện nhận diện khuôn mặt.
-    Kết quả của mỗi ảnh (bao gồm thời gian xử lý, kết quả nhận diện) sẽ được lưu lại vào một file JSON.
+# FastAPI setup
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class ImageData(BaseModel):
+    image: str
+
+class StringData(BaseModel):
+    message : str
+
+def remove_accents(text):
+    # Normalize the text to decompose accented characters
+    normalized = unicodedata.normalize('NFD', text)
+    # Filter out combining diacritical marks
+    return ''.join(c for c in normalized if not unicodedata.combining(c))
+
+# Khởi tạo detector với việc preload embeddings
+detector = Detect(
+    model_file="checkpoints/GhostFaceNet_W1.3_S1_ArcFace.h5", 
+    known_user_path="data/distorted_faces_112_112/train"
+)
+
+UPLOAD_DIR = "/app/GhostFaceNets/testtt"  # Folder to store files
+os.makedirs(UPLOAD_DIR, exist_ok=True)  # Ensure the folder exists
+
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+transcriber = WhisperTranscriber()
+
+@app.post("/api_chatbot")
+async def upload_audio(file: UploadFile = File(...)):
+    # Read the audio file content from the uploaded file
+    audio_data = await file.read()
+    if len(audio_data) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File too large. Maximum size allowed: {MAX_FILE_SIZE/1024/1024}MB"
+            )
     
-    :param detector: Đối tượng Detect đã được khởi tạo
-    :param folder_path: Đường dẫn folder chứa ảnh cần nhận diện
-    :param output_json_path: Đường dẫn file JSON lưu kết quả
-    :param dist_thresh: Ngưỡng khoảng cách để phân loại
+    original_file_path = os.path.join(UPLOAD_DIR, 'testsomethinghere.temp')
+
+    os.makedirs(os.path.dirname(original_file_path), exist_ok=True)
+    with open(original_file_path, "wb") as temp_file:
+        temp_file.write(audio_data)
+
+    wav_file_path = os.path.join(UPLOAD_DIR, "audio.wav")
+    # Convert to .wav format
+    audio = AudioSegment.from_file(original_file_path)
+    audio.export(wav_file_path, format="wav")
+    # Transcribe audio với hoặc không có language specified
+    result = transcriber.transcribe(
+        wav_file_path,
+        language=None, 
+        return_timestamps=True
+    )
+    print(result["text"])   
+    return {"message": result["text"]}
+@app.post("/detect")
+async def detect_face(data: ImageData):
     """
-    # Lấy danh sách các file ảnh (có đuôi jpg, jpeg, png)
-    valid_extensions = ('.jpg', '.jpeg', '.png')
-    image_files = [os.path.join(root, file)
-                   for root, dirs, files in os.walk(folder_path)
-                   for file in files if file.lower().endswith(valid_extensions)]
-    
-    logger.info(f"Tìm thấy {len(image_files)} ảnh trong folder {folder_path}")
-
-    results = {}
-
-    for image_file in tqdm(image_files, desc="Processing images"):
-        try:
-            # Đọc ảnh bằng PIL và chuyển sang numpy array (RGB)
-            img = Image.open(image_file).convert("RGB")
-            img_np = np.array(img)
-            
-            # Đo thời gian nhận diện cho ảnh
-            start_time = time.time()
-            result = detector.recognize_faces(img_np, dist_thresh=dist_thresh)
-            end_time = time.time()
-            recognition_time = end_time - start_time
-
-            if result:
-                rec_dist, rec_class, bbs, ccs = result
-                result_data = {
-                    "recognized_labels": rec_class,
-                    "confidence": [float(dist) for dist in rec_dist],
-                    "bounding_boxes": bbs.tolist(),  # chuyển sang list nếu cần
-                    "confidence_scores": ccs.tolist() if hasattr(ccs, "tolist") else ccs,
-                    "processing_time": recognition_time
-                }
-            else:
-                result_data = {
-                    "message": "No face detected",
-                    "processing_time": recognition_time
-                }
-            
-            results[os.path.basename(image_file)] = result_data
-        
-        except Exception as e:
-            logger.error(f"Lỗi xử lý ảnh {image_file}: {e}")
-            results[os.path.basename(image_file)] = {"error": str(e)}
-
-    # Lưu kết quả vào file JSON
-    with open(output_json_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=4)
-
-    logger.info(f"Kết quả nhận diện đã được lưu vào file {output_json_path}")
-
-# ==========================
-# Main: Khởi tạo detector và chạy nhận diện folder
-# ==========================
-if __name__ == "__main__":
-    # Chỉnh sửa đường dẫn dưới đây cho phù hợp với hệ thống của bạn:
-    MODEL_FILE = "/app/GhostFaceNets/checkpoints/GhostFaceNet_W1.3_S1_ArcFace.h5"
-    MODEL_FILE2= "/"
-    KNOWN_USER_PATH = "data/test/complete_images/train"  # Folder chứa ảnh đã biết
-    TEST_FOLDER = "data/test/folder_images"             # Folder chứa ảnh cần nhận diện
-    OUTPUT_JSON = "results_folder.json"
-
+    Endpoint nhận diện khuôn mặt
+    """
+    # start_time = time.time()  # Bắt đầu đo thời gian
+    print('get request!!!!')
     try:
-        # Khởi tạo detector
-        detector = Detect(model_file=MODEL_FILE, known_user_path=KNOWN_USER_PATH)
-        # Thực hiện nhận diện trên folder ảnh
-        recognize_folder_images(detector, TEST_FOLDER, output_json_path=OUTPUT_JSON, dist_thresh=0.45)
+        # Giải mã ảnh
+        image_data = base64.b64decode(data.image)
+        img = Image.open(io.BytesIO(image_data))
+        img_np = np.array(img.convert("RGB"))
+
+        # Nhận diện khuôn mặt
+        print('detecting face')
+        result = detector.recognize_faces(img_np, dist_thresh=0.55)
+        rec_dist, rec_class, bbs, ccs = result
+        print(f"Result: {rec_dist}")
+        
+        if result:
+            rec_dist, rec_class, bbs, ccs = result
+            result_image = detector.draw_polyboxes(img_np, rec_dist, rec_class, bbs, ccs, dist_thresh=0.6)
+            end = time.time()  # Bắt đầu đo thời gian
+            # print(end - start_time)
+            return {
+                "result_image": rec_class,
+                "confidence": [float(dist) for dist in rec_dist]
+            }
+        else:
+            end = time.time()  # Bắt đầu đo thời gian
+            print(end - start_time)
+            return {"result_image": "Xin chào"}
+    
     except Exception as e:
-        logger.error(f"Error in main: {e}")
+        logger.error(f"Detection error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/")
+async def root():
+    return {"message": "Welcome to the face detection API"}
+
+# if __name__ == "__main__":
+#     uvicorn.run(app, host="0.0.0.0", port=8080, ssl_keyfile="/ohmni/privatekey.pem", ssl_certfile="/ohmni/certificate.pem")
